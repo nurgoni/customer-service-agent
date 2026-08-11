@@ -1,10 +1,13 @@
+# src/main.py
+
 import os
 from contextlib import asynccontextmanager
-import anthropic
+from openai import OpenAI
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
+from src.config import OPENAI_API_KEY
 from src.db.database import get_connection, init_db
 from src.retrieval.embedder import get_embedder
 from src.retrieval.hybrid_search import build_bm25_index
@@ -17,14 +20,10 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown lifecycle."""
-
     # --- Startup ---
+    # if not OPENAI_API_KEY:
+    #     raise RuntimeError("OPENAI_API_KEY not set")
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("")
-    
     print("[ startup ] connecting to database...")
     conn = get_connection()
     init_db(conn)
@@ -37,28 +36,30 @@ async def lifespan(app: FastAPI):
     build_bm25_index(conn)
 
     print("[ startup ] initialising agent...")
-    client = anthropic.Anthropic(api_key=api_key)
+    client = OpenAI(
+        base_url="http://localhost:11434/v1",
+        api_key="ollama",
+    )
     app.state.agent = CustomerServiceAgent(client=client, conn=conn)
 
-    print("[ startup ] ready.")
+    print("[ startup ] ready ✅")
     yield
 
     # --- Shutdown ---
-    print("[ shutdown ] closing database connection...")
     conn.close()
+
 
 app = FastAPI(
     title="Customer Service Agent API",
-    description="Three-lane chatbot: general, product search, exact fact lookup",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins==["*"],
-    allow_method=["*"],
-    allow_headers=["*"]
+    allow_origins=["*"],       # ← fixed: single =
+    allow_methods=["*"],       # ← fixed: allow_methods (plural)
+    allow_headers=["*"],
 )
 
 app.include_router(router, prefix="/api/v1")
