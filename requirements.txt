@@ -1,5 +1,6 @@
 # ── Core LLM ─────────────────────────────────────────────────────────────────
 anthropic>=0.40.0          # Anthropic Python SDK — tool-use, streaming, typed
+openai
 
 # ── API layer ─────────────────────────────────────────────────────────────────
 fastapi>=0.115.0           # Async ASGI web framework
@@ -26,3 +27,11 @@ pydantic>=2.7.0            # Request/response validation, settings management
 python-dotenv>=1.0.0       # .env file loading
 rich>=13.0.0               # Pretty terminal output
 httpx>=0.27.0              # Async HTTP client (used in tests)
+
+ipykernel
+langchain
+langchain-ollama
+tqdm
+pandas
+
+moviepy
