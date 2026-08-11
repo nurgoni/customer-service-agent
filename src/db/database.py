@@ -1,40 +1,105 @@
+# src/db/database.py
+
 import sqlite3
 import struct
 import numpy as np
 from pathlib import Path
 
+from src.config import DB_PATH
 
-DB_PATH = Path("data/cs_agent.db")
-
+# ═══════════════════════════════════════════════════════════════
+# CONNECTION
+# ═══════════════════════════════════════════════════════════════
 
 def _serialize_vector(v: np.ndarray) -> bytes:
-    """
-    Pack a float32 numpy vector into the binary format sqlite-vec expects.
-    """
     return struct.pack(f"{len(v)}f", *v.astype(np.float32))
 
 
 def get_connection() -> sqlite3.Connection:
-    """
-    Open (or reuse) the SQLite connection with sqlite-vec loaded.
-    WAL mode: readers never block writers; writers never block readers.
-    This is essential for an async FastAPI server where multiple
-    requests may hit the DB simultaneously.
-    """
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row          # ← akses kolom by name
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
 
+    # Load sqlite-vec jika tersedia (opsional, untuk vector search)
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except (ImportError, Exception):
+        print("[ db ] sqlite-vec not available, vector search disabled")
+
+    return conn
+
+
+# ═══════════════════════════════════════════════════════════════
+# SCHEMA
+# ═══════════════════════════════════════════════════════════════
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """
-    Create schema if it doesn't exist.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS products (
+            id           TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            price        REAL NOT NULL CHECK(price > 0),
+            description  TEXT NOT NULL DEFAULT '',
+            product_type TEXT NOT NULL DEFAULT '',
+            stock        INTEGER NOT NULL DEFAULT 0
+        );
+    """)
 
-    Two tables:
-        products     - relationale, the source of truth for price stock
-        product_vecs - virtual vec0 table for ANN vector search 
-    
-    The vec0 table stores 384-dim float32 embeddings (matching
-    all-MiniLM-L6-v2 output dimension). Each row is keyed by the
-    products.id rowid so a join retrieves the full product record.
+    # Coba buat vec0 table (skip jika sqlite-vec tidak ter-load)
+    try:
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS product_vecs
+            USING vec0(embedding float[384])
+        """)
+        # Mapping rowid → product.id
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS product_rowids (
+                rowid INTEGER PRIMARY KEY,
+                pid   TEXT NOT NULL REFERENCES products(id)
+            )
+        """)
+    except Exception:
+        print("[ db ] skipping vector table creation")
+
+    conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════════
+# QUERY HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def lookup_product_by_id(
+    conn: sqlite3.Connection,
+    product_id: str
+) -> sqlite3.Row | None:
+    """Exact lookup by primary key."""
+    return conn.execute(
+        "SELECT * FROM products WHERE id = ?", (product_id,)
+    ).fetchone()
+
+
+def search_products_by_keyword(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 10
+) -> list[sqlite3.Row]:
     """
+    Fuzzy keyword search across name, description, product_type.
+    Ini adalah fallback jika vector search tidak tersedia.
+    """
+    wildcard = f"%{query}%"
+    return conn.execute("""
+        SELECT * FROM products
+        WHERE LOWER(name)         LIKE LOWER(?)
+           OR LOWER(description)  LIKE LOWER(?)
+           OR LOWER(product_type) LIKE LOWER(?)
+        LIMIT ?
+    """, (wildcard, wildcard, wildcard, limit)).fetchall()
 
 
 def vector_search(
@@ -42,16 +107,16 @@ def vector_search(
     query_embedding: np.ndarray,
     k: int = 20
 ) -> list[tuple[str, float]]:
-    """
-    ANN search over the vec0 table.
-    Returns list of (product_id, distance) - lower distance = more similar.
-    """
+    """ANN search over vec0 table."""
     query_bytes = _serialize_vector(query_embedding)
-    rows = conn.execute("""
-        SELECT pr.pid, v.distance
-        FROM product_vecs v
-        JOIN product_rowids pr ON pr.rowid = v.rowid
-        WHERE v.embedding MATCH ? AND k = ?
-        ORDER BY v.distance
-    """, (query_bytes, k)).fetchall()
-    return [(r["pid"], r["distance"]) for r in rows]
+    try:
+        rows = conn.execute("""
+            SELECT pr.pid, v.distance
+            FROM product_vecs v
+            JOIN product_rowids pr ON pr.rowid = v.rowid
+            WHERE v.embedding MATCH ? AND k = ?
+            ORDER BY v.distance
+        """, (query_bytes, k)).fetchall()
+        return [(r["pid"], r["distance"]) for r in rows]
+    except Exception:
+        return []
