@@ -19,10 +19,10 @@ class IntentResult(BaseModel):
     """
     intent: Intent
     confidence: float = Field(ge=0., le=1.)
-    extracted_query: str = Field(description="Cleaned query to pass downstream")
+    extracted_query: str = Field(description="Query raw dari user")
     product_id: str | None = Field(
         default=None,
-        description="Extracted product ID for EXACT_FACT queries (if present)"
+        description="nama atau ID khusus dari suatu produk."
     )
 
 
@@ -45,7 +45,7 @@ class Product(BaseModel):
     product_type: str
     stock: int = Field(ge=0.)
 
-    @field_validator
+    @field_validator("price")
     @classmethod
     def price_must_be_positive(cls, v: float) -> float:
         if v <= 0:
