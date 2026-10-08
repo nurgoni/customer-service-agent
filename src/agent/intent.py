@@ -1,90 +1,90 @@
-# src/agent/intent.py
-
 import json
 import re
+
 from openai import OpenAI
 
-from src.config import OPENAI_API_KEY, OPENAI_MODEL_FAST
-from src.models.schemas import Intent, IntentResult, ChatMessage
+from src.config import LLM_EXTRA, OPENAI_MODEL_FAST
+from src.models.schemas import ChatMessage, Intent, IntentResult
 
+_CLASSIFIER_PROMPT = """Kamu adalah pengklasifikasi intent untuk agent layanan pelanggan toko online.
+Klasifikasikan pesan pengguna ke salah satu dari tiga kategori:
 
-_CLASSIFIER_PROMPT = """Kamu adalah AI yang bertugas untuk mendeteksi kategori pesan dari user.
-Setiap pesan masuk dari user pasti akan terdiri dari tiga kategori dibawah ini:
+- "general": sapaan, pertanyaan umum (cara order, pengiriman, retur), atau di luar topik produk.
+- "product_search": pengguna mencari/meminta rekomendasi produk berdasarkan kategori, rentang harga, atau kebutuhan.
+- "exact_fact": pengguna menanyakan harga/stok/detail SATU produk spesifik yang nama atau ID-nya disebut.
 
-- "general": pertanyaan umum, sapaan, atau diluar topik mengenai produk.
-- "product_search": pengguna mencari produk berdasarkan kategori, kebutuhan, atau deskripsi umum.
-- "exact_fact": pengguna menanyakan detail atau harga satu produk berdasarkan nama produk tersebut.
-
-response output yang kamu berikan harus dalam bentuk JSON dengan fields:
-
-intent: kategori chat dari user.
-confidence: tingkat keyakinan anda terhadap prediksi kategori.
-extracted_query: raw chat dari user.
-product_id: Nama dari produk yang sedang dicari detail atau harga-nya. Jika chat bukan kategori "exact_fact", maka nilainya adalah None.
-
-contoh response jika kategori chat user adalah general:
-{
-    "intent": "general", 
-    "confidence": 0.95, 
-    "extracted_query": "Bagaimana kabarmu hari ini", 
-    "product_id": None
-}
+Balas HANYA dengan satu objek JSON dengan field:
+{"intent": "general|product_search|exact_fact", "confidence": 0.0-1.0, "extracted_query": "kata kunci pencarian singkat", "product_id": "ID seperti SKU001 jika disebut, atau null"}
 """
 
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
-def classify_intent(
-    client: OpenAI,
-    user_message: str,
-    history: list[ChatMessage],
-) -> IntentResult:
+
+def clean_llm_text(text: str | None) -> str:
+    """Buang blok <think>...</think> yang kadang ikut di content pada model thinking (Qwen3 dkk)."""
+    text = _THINK_BLOCK.sub("", text or "")
+    # blok <think> yang terpotong (tanpa penutup) -> tidak ada jawaban yang bisa dipakai
+    if "<think>" in text.lower():
+        text = text[: text.lower().index("<think>")]
+    return text.strip()
+
+
+def _extract_json(raw: str) -> dict:
+    """Ambil objek JSON pertama dari teks (toleran terhadap code fence / kalimat pembuka)."""
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _fallback(user_message: str) -> IntentResult:
+    return IntentResult(intent=Intent.GENERAL, confidence=0.0, extracted_query=user_message, product_id=None)
+
+
+def classify_intent(client: OpenAI, user_message: str, history: list[ChatMessage]) -> IntentResult:
     history_snippet = ""
     if history:
-        recent = history[-3:]
-        history_snippet = "\n".join(
-            f"{m.role.upper()}: {m.content}" for m in recent
-        )
-        history_snippet = f"\nRecent conversation:\n{history_snippet}\n"
+        recent = "\n".join(f"{m.role.upper()}: {m.content}" for m in history[-3:])
+        history_snippet = f"Recent conversation:\n{recent}\n\n"
 
+    # Catatan: classifier TIDAK diberi `tools` - tugasnya hanya mengembalikan JSON.
     response = client.chat.completions.create(
         model=OPENAI_MODEL_FAST,
-        max_tokens=1024,
+        max_tokens=512,
+        temperature=0,
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": _CLASSIFIER_PROMPT},
             {"role": "user", "content": f"{history_snippet}User message: {user_message}"},
         ],
-        extra_body={"think": False}
+        **LLM_EXTRA,
     )
 
-    raw = response.choices[0].message.content.strip()
-    # raw = response.choices[0].message
+    choice = response.choices[0]
+    raw = clean_llm_text(choice.message.content)
+    print(f"[intent] model={response.model} finish_reason={choice.finish_reason} raw={raw!r}", flush=True)
 
-    # ── DEBUG: print SEBELUM parsing, pakai flush=True ──
-    # print(f"[DEBUG] raw content dari OpenAI: {repr(raw)}", flush=True)
-
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-
-    print(f"[DEBUG] raw content dari OpenAI: {repr(raw)}", flush=True)
+    if not raw:
+        print("[intent] content kosong -> fallback general (cek thinking mode / num_ctx model)", flush=True)
+        return _fallback(user_message)
 
     try:
-        data = json.loads(raw)
-
-        print(f"[DEBUG] parsed intent: {data}", flush=True)
-
+        data = _extract_json(raw)
+        product_id = data.get("product_id")
+        if not product_id or str(product_id).lower() in ("null", "none"):
+            product_id = None
+        confidence = min(max(float(data.get("confidence", 0.8)), 0.0), 1.0)
         return IntentResult(
-            intent=Intent(data["intent"]),
-            confidence=float(data.get("confidence", 0.8)),
-            extracted_query=data.get("extracted_query", user_message),
-            product_id=data.get("product_id"),
+            intent=Intent(str(data["intent"]).strip().lower()),
+            confidence=confidence,
+            extracted_query=data.get("extracted_query") or user_message,
+            product_id=product_id,
         )
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        # ── DEBUG: cetak error aslinya, jangan silent ──
-        print(f"[DEBUG] ⚠️ Parsing gagal! Error: {e}", flush=True)
-        print(f"[DEBUG] Raw yang gagal di-parse: {repr(raw)}", flush=True)
-
-        return IntentResult(
-            intent=Intent.GENERAL,
-            confidence=0.0,
-            extracted_query=user_message,
-            product_id=None,
-        )
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError, AttributeError) as e:
+        print(f"[intent] gagal parse ({e}) -> fallback general", flush=True)
+        return _fallback(user_message)

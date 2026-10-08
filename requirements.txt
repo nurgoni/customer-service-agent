@@ -1,37 +1,10 @@
-# ── Core LLM ─────────────────────────────────────────────────────────────────
-anthropic>=0.40.0          # Anthropic Python SDK — tool-use, streaming, typed
-openai
-
-# ── API layer ─────────────────────────────────────────────────────────────────
-fastapi>=0.115.0           # Async ASGI web framework
-uvicorn[standard]>=0.30.0  # ASGI server with WebSocket + hot-reload
-
-# ── Embeddings ────────────────────────────────────────────────────────────────
-# sentence-transformers runs locally: no per-call cost, no external dependency.
-# all-MiniLM-L6-v2 is 22MB, 384-dim — the standard lightweight choice.
-sentence-transformers>=3.0.0
+openai>=1.40.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0
 numpy>=1.26.0
-
-# ── Vector + relational store ─────────────────────────────────────────────────
-# sqlite-vec: vector search as a SQLite extension — zero extra infra, works
-# anywhere SQLite works. Competitive with pgvector for < 100k rows.
-sqlite-vec>=0.1.6
-
-# ── BM25 keyword search ───────────────────────────────────────────────────────
-# rank-bm25: pure Python, no server. Used alongside vector search for hybrid
-# retrieval via Reciprocal Rank Fusion (RRF).
 rank-bm25>=0.2.2
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
-pydantic>=2.7.0            # Request/response validation, settings management
-python-dotenv>=1.0.0       # .env file loading
-rich>=13.0.0               # Pretty terminal output
-httpx>=0.27.0              # Async HTTP client (used in tests)
-
-ipykernel
-langchain
-langchain-ollama
-tqdm
-pandas
-
-moviepy
+sqlite-vec>=0.1.1

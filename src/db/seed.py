@@ -1,102 +1,106 @@
-# src/db/seed.py
-
 """
-Pemakaian:
-    python -m src.db.seed --file data/products.csv
+Load CSV/Excel produk ke database (+ embedding bila sqlite-vec tersedia).
+
+Pemakaian (jalankan dari folder root project, yaitu yang berisi folder `src`):
+    python -m src.db.seed                              # default: data/products.csv
     python -m src.db.seed --file data/products.xlsx
+
+Jalankan ulang seed setiap kali data produk ATAU model embedding diganti.
 """
 
 import argparse
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
 
-from src.db.database import get_connection, init_db, _serialize_vector
-from src.retrieval.embedder import embed_batch
+from src.config import BASE_DIR, EMBEDDING_MODEL
+from src.db import database
+from src.db.database import _serialize_vector, get_connection, init_db, recreate_vector_table
+
+REQUIRED_COLUMNS = {"id", "name", "price"}
 
 
-SAMPLE_DATA = [
-    ("SKU001", "Nike Air Max 270",      2199000, "Sepatu lari ringan dengan bantalan Air Max",         "Sepatu",     45),
-    ("SKU002", "Adidas Ultraboost 23",  2899000, "Sepatu lari premium dengan teknologi Boost",         "Sepatu",     30),
-    ("SKU003", "Uniqlo Airism T-Shirt",  199000, "Kaos teknologi pendingin, cepat kering, anti bau",   "Pakaian",   200),
-    ("SKU004", "Samsung Galaxy S24",   13999000, "Smartphone flagship AI Galaxy, kamera 200MP",        "Elektronik", 15),
-    ("SKU005", "Sony WH-1000XM5",       4999000, "Headphone wireless noise cancelling 30 jam battery", "Elektronik", 25),
-    ("SKU006", "Erigo Flannel Shirt",    259000, "Kemeja flannel kotak-kotak casual katun premium",    "Pakaian",    80),
-]
+def load_dataframe(path: Path) -> pd.DataFrame:
+    ext = path.suffix.lower()
+    if ext == ".csv":
+        df = pd.read_csv(path)
+    elif ext in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+    else:
+        raise ValueError(f"Format file tidak didukung: {ext}")
+
+    df.columns = [c.strip().lower() for c in df.columns]
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"Kolom wajib tidak ditemukan: {sorted(missing)}. Kolom yang ada: {list(df.columns)}")
+
+    for col, default in (("description", ""), ("product_type", ""), ("stock", 0)):
+        if col not in df.columns:
+            df[col] = default
+    df["description"] = df["description"].fillna("")
+    df["product_type"] = df["product_type"].fillna("")
+    df["stock"] = df["stock"].fillna(0).astype(int)
+    return df
 
 
 def seed_from_dataframe(df: pd.DataFrame) -> None:
-    """
-    Expects columns: id, name, price, description, product_type, stock
-    """
     conn = get_connection()
     init_db(conn)
 
-    # ── Insert products ──
     for _, row in df.iterrows():
-        conn.execute("""
+        conn.execute(
+            """
             INSERT OR REPLACE INTO products (id, name, price, description, product_type, stock)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            str(row["id"]),
-            str(row["name"]),
-            float(row["price"]),
-            str(row.get("description", "")),
-            str(row.get("product_type", "")),
-            int(row.get("stock", 0)),
-        ))
+            """,
+            (
+                str(row["id"]).strip(),
+                str(row["name"]).strip(),
+                float(row["price"]),
+                str(row["description"]),
+                str(row["product_type"]),
+                int(row["stock"]),
+            ),
+        )
     conn.commit()
-    print(f"✅ {len(df)} products inserted into database")
+    print(f"[seed] {len(df)} produk dimasukkan ke tabel products")
 
-    # ── Generate & store embeddings ──
-    texts = [
-        f"{row['name']} - {row.get('product_type', '')} - {row.get('description', '')}"
-        for _, row in df.iterrows()
-    ]
+    if not database.VEC_AVAILABLE:
+        print("[seed] sqlite-vec tidak tersedia -> embedding dilewati (BM25 tetap berfungsi)")
+        conn.close()
+        return
 
     try:
-        print("⏳ Generating embeddings...")
-        vectors = embed_batch(texts)
+        from src.retrieval.embedder import embed_batch
 
-        for i, (_, row) in enumerate(df.iterrows()):
-            vec_bytes = _serialize_vector(vectors[i])
+        texts = [
+            f"{r['name']} - {r['product_type']} - {r['description']}" for _, r in df.iterrows()
+        ]
+        print(f"[seed] membuat embedding dengan model '{EMBEDDING_MODEL}'...")
+        vectors = embed_batch(texts)
+        dim = int(vectors.shape[1])
+
+        recreate_vector_table(conn, dim)
+        for i, (_, row) in enumerate(df.iterrows(), start=1):
             conn.execute(
-                "INSERT OR REPLACE INTO product_vecs (rowid, embedding) VALUES (?, ?)",
-                (i + 1, vec_bytes)
+                "INSERT INTO product_vecs (rowid, embedding) VALUES (?, ?)",
+                (i, _serialize_vector(vectors[i - 1])),
             )
             conn.execute(
-                "INSERT OR REPLACE INTO product_rowids (rowid, pid) VALUES (?, ?)",
-                (i + 1, str(row["id"]))
+                "INSERT INTO product_rowids (rowid, pid) VALUES (?, ?)",
+                (i, str(row["id"]).strip()),
             )
         conn.commit()
-        print(f"✅ {len(vectors)} embeddings stored")
+        print(f"[seed] {len(vectors)} embedding tersimpan (dimensi {dim})")
     except Exception as e:
-        print(f"⚠️  Embedding storage skipped: {e}")
-
-    conn.close()
-
-
-def seed_sample():
-    """Load built-in sample data."""
-    df = pd.DataFrame(SAMPLE_DATA, columns=[
-        "id", "name", "price", "description", "product_type", "stock"
-    ])
-    seed_from_dataframe(df)
+        print(f"[seed] embedding dilewati: {e}")
+        print("[seed] pastikan Ollama berjalan dan model embedding sudah di-pull; BM25 tetap berfungsi")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file", type=str, default=None)
+    parser.add_argument("--file", type=str, default=str(BASE_DIR / "data" / "products.csv"))
     args = parser.parse_args()
-
-    if args.file:
-        ext = args.file.rsplit(".", 1)[-1].lower()
-        if ext == "csv":
-            df = pd.read_csv(args.file)
-        elif ext in ("xlsx", "xls"):
-            df = pd.read_excel(args.file)
-        else:
-            raise ValueError(f"Unsupported format: {ext}")
-        seed_from_dataframe(df)
-    else:
-        print("No file provided, using sample data...")
-        seed_sample()
+    seed_from_dataframe(load_dataframe(Path(args.file)))
