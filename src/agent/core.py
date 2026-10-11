@@ -1,13 +1,25 @@
 import json
+import logging
 import sqlite3
 
 from openai import OpenAI
 
+from src.agent.events import step
 from src.agent.intent import classify_intent, clean_llm_text
-from src.config import LLM_EXTRA, OPENAI_MODEL
+from src.config import LLM_EXTRA, OPENAI_MODEL, OPENAI_MODEL_FAST
 from src.models.schemas import AgentState, Intent, ProductSearchResult
+from src.observability import (
+    current_trace_url,
+    llm_kwargs,
+    observe,
+    set_trace_io,
+    trace_attributes,
+    update_span,
+)
 from src.retrieval.hybrid_search import hybrid_search
 from src.tools.product_tools import PRODUCT_TOOL_SCHEMAS, execute_tool
+
+logger = logging.getLogger("cs_agent.agent")
 
 _SYSTEM_GENERAL = """Kamu adalah customer service AI yang ramah untuk toko online kami.
 Jawab sapaan dan pertanyaan umum (cara order, pengiriman, retur, dll) secara natural.
@@ -40,6 +52,11 @@ ATURAN KRITIS:
 _EMPTY_REPLY_FALLBACK = "Maaf, saya belum bisa menjawab saat ini. Silakan coba lagi sebentar lagi."
 
 
+def _output_tokens(response) -> int | None:
+    usage = getattr(response, "usage", None)
+    return getattr(usage, "completion_tokens", None) if usage else None
+
+
 class CustomerServiceAgent:
     MAX_TOOL_ROUNDS = 5
 
@@ -49,30 +66,75 @@ class CustomerServiceAgent:
 
     # ---------------------------------------------------------------- public
 
+    @observe(name="customer-service-turn", as_type="agent")
     def run(self, state: AgentState) -> AgentState:
-        intent_result = classify_intent(self.client, state.user_message, state.conversation_history)
-        state.intent = intent_result.intent
+        """Satu giliran chat. Saat Langfuse aktif, seluruh giliran ini menjadi satu trace."""
+        with step("turn", message=state.user_message) as info:
+            state = self._run(state)
+            info.update(
+                intent=state.intent.value if state.intent else None,
+                sources=state.sources,
+                products=state.shown_product_ids,
+            )
+        return state
 
-        if state.intent == Intent.GENERAL:
-            return self._lane_general(state)
-        if state.intent == Intent.PRODUCT_SEARCH:
-            return self._lane_product_search(state, intent_result.extracted_query)
-        return self._lane_exact_fact(state, intent_result.product_id)
+    def _run(self, state: AgentState) -> AgentState:
+        with trace_attributes(
+            session_id=state.session_id,
+            user_id=state.user_id,
+            trace_name="customer-service-chat",
+            metadata={"model": OPENAI_MODEL, "intent_model": OPENAI_MODEL_FAST},
+        ):
+            update_span(input={"message": state.user_message, "history_length": len(state.conversation_history)})
+
+            intent_result = classify_intent(self.client, state.user_message, state.conversation_history)
+            state.intent = intent_result.intent
+
+            # Tag intent memudahkan filter trace per jalur di UI Langfuse.
+            with trace_attributes(tags=[f"intent:{state.intent.value}"]):
+                if state.intent == Intent.GENERAL:
+                    state = self._lane_general(state)
+                elif state.intent == Intent.PRODUCT_SEARCH:
+                    state = self._lane_product_search(state, intent_result.extracted_query)
+                else:
+                    state = self._lane_exact_fact(state, intent_result.product_id)
+
+            update_span(
+                output={
+                    "reply": state.final_reply,
+                    "intent": state.intent.value,
+                    "sources": state.sources,
+                    "products_shown": state.shown_product_ids,
+                },
+                metadata={
+                    "intent_confidence": intent_result.confidence,
+                    "extracted_query": intent_result.extracted_query,
+                    "tool_calls": len(state.tool_results),
+                },
+            )
+            set_trace_io(input=state.user_message, output=state.final_reply)
+            state.trace_url = current_trace_url()
+        return state
 
     # ----------------------------------------------------------- lane general
 
+    @observe(name="lane-general", as_type="chain")
     def _lane_general(self, state: AgentState) -> AgentState:
         text = self._chat(
             [{"role": "system", "content": _SYSTEM_GENERAL}, *self._build_messages(state)],
             max_tokens=1024,
+            generation_name="answer-general",
         )
         state.final_reply = text or _EMPTY_REPLY_FALLBACK
         state.sources = ["llm_only"]
+        update_span(output=state.final_reply)
         return state
 
     # ---------------------------------------------------- lane product search
 
+    @observe(name="lane-product-search", as_type="chain")
     def _lane_product_search(self, state: AgentState, query: str) -> AgentState:
+        update_span(input={"query": query})
         results: list[ProductSearchResult] = hybrid_search(self.conn, query, top_k=5)
         state.retrieved_products = results
         state.shown_product_ids = [r.product.id for r in results]
@@ -95,14 +157,18 @@ class CustomerServiceAgent:
                 *self._build_messages(state),
             ],
             max_tokens=1024,
+            generation_name="answer-product-search",
         )
         state.final_reply = text or _EMPTY_REPLY_FALLBACK
         state.sources = ["hybrid_search"]
+        update_span(output=state.final_reply, metadata={"products_in_context": state.shown_product_ids})
         return state
 
     # ------------------------------------------------------ lane exact fact
 
+    @observe(name="lane-exact-fact", as_type="chain")
     def _lane_exact_fact(self, state: AgentState, product_id: str | None) -> AgentState:
+        update_span(input={"product_id_hint": product_id})
         system = _SYSTEM_EXACT_FACT
         if product_id:
             # Hint digabung ke system prompt: pesan system di tengah percakapan tidak selalu didukung model lokal.
@@ -110,21 +176,29 @@ class CustomerServiceAgent:
 
         messages: list[dict] = [{"role": "system", "content": system}, *self._build_messages(state)]
 
-        for _ in range(self.MAX_TOOL_ROUNDS):
-            response = self.client.chat.completions.create(
-                model=OPENAI_MODEL,
-                max_tokens=1024,
-                temperature=0,
-                messages=messages,
-                tools=PRODUCT_TOOL_SCHEMAS,
-                **LLM_EXTRA,
-            )
-            message = response.choices[0].message
+        for round_no in range(1, self.MAX_TOOL_ROUNDS + 1):
+            with step("llm", purpose="tool_round", round=round_no) as info:
+                response = self.client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    max_tokens=1024,
+                    temperature=0,
+                    messages=messages,
+                    tools=PRODUCT_TOOL_SCHEMAS,
+                    **LLM_EXTRA,
+                    **llm_kwargs(f"tool-calling-round-{round_no}"),
+                )
+                message = response.choices[0].message
+                info.update(
+                    next="tools" if message.tool_calls else "answer",
+                    tools=[tc.function.name for tc in message.tool_calls or []],
+                    output_tokens=_output_tokens(response),
+                )
 
             if not message.tool_calls:
                 state.final_reply = clean_llm_text(message.content) or _EMPTY_REPLY_FALLBACK
                 if "db_lookup" not in state.sources:
                     state.sources.append("db_lookup")
+                update_span(output=state.final_reply, metadata={"rounds": round_no})
                 return state
 
             # Simpan giliran assistant sebagai dict biasa agar aman untuk endpoint kompatibel-OpenAI (Ollama).
@@ -153,7 +227,7 @@ class CustomerServiceAgent:
                     tool_args = {}
                 result_json = execute_tool(self.conn, tool_name, tool_args)
                 result = json.loads(result_json)
-                print(f"[agent] tool={tool_name} args={tool_args}", flush=True)
+                logger.info("tool=%s args=%s", tool_name, tool_args)
 
                 state.tool_results.append({"tool": tool_name, "input": tool_args, "output": result})
                 self._collect_product_ids(state, result)
@@ -162,22 +236,30 @@ class CustomerServiceAgent:
 
         state.final_reply = "Maaf, saya mengalami kesulitan mengambil data produk. Silakan coba lagi."
         state.sources.append("error")
+        update_span(
+            output=state.final_reply,
+            level="ERROR",
+            status_message=f"tool loop melebihi {self.MAX_TOOL_ROUNDS} ronde",
+        )
         return state
 
     # --------------------------------------------------------------- helpers
 
-    def _chat(self, messages: list, max_tokens: int) -> str:
-        response = self.client.chat.completions.create(
-            model=OPENAI_MODEL,
-            max_tokens=max_tokens,
-            temperature=0.3,
-            messages=messages,
-            **LLM_EXTRA,
-        )
+    def _chat(self, messages: list, max_tokens: int, generation_name: str) -> str:
+        with step("llm", purpose="answer") as info:
+            response = self.client.chat.completions.create(
+                model=OPENAI_MODEL,
+                max_tokens=max_tokens,
+                temperature=0.3,
+                messages=messages,
+                **LLM_EXTRA,
+                **llm_kwargs(generation_name),
+            )
+            info.update(next="answer", output_tokens=_output_tokens(response))
         choice = response.choices[0]
         text = clean_llm_text(choice.message.content)
         if not text:
-            print(f"[agent] jawaban kosong finish_reason={choice.finish_reason}", flush=True)
+            logger.warning("jawaban kosong finish_reason=%s", choice.finish_reason)
         return text
 
     @staticmethod

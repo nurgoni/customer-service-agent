@@ -219,3 +219,7 @@ __marimo__/
 
 *.db
 data/*
+
+notebook/*.json
+notebook/*.csv
+notebook/*.png

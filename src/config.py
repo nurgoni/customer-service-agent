@@ -7,6 +7,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 load_dotenv(BASE_DIR / ".env")
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
 # --- LLM (OpenAI SDK; arahkan ke Ollama lewat OPENAI_BASE_URL) ---
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL") or None  # None = OpenAI asli
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -26,3 +34,16 @@ DB_PATH = BASE_DIR / "data" / "cs_agent.db"
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "bge-m3:567m")
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL") or OPENAI_BASE_URL
 # Dimensi vektor TIDAK di-hardcode: tabel vektor dibuat saat seed mengikuti dimensi model (bge-m3 = 1024).
+
+# --- Logging ---
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+
+# --- Observability (Langfuse, opsional) ---
+# Tracing aktif hanya bila public key DAN secret key diisi, dan LANGFUSE_ENABLED tidak diset false.
+LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY") or None
+LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY") or None
+# Default ke server Langfuse lokal (docker compose), bukan Langfuse Cloud.
+LANGFUSE_BASE_URL = (
+    os.environ.get("LANGFUSE_BASE_URL") or os.environ.get("LANGFUSE_HOST") or "http://localhost:3000"
+)
+LANGFUSE_ENABLED = bool(LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY) and _env_bool("LANGFUSE_ENABLED", True)
