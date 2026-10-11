@@ -8,6 +8,8 @@ from src.models.schemas import (
     ProductDetailResult,
     format_rupiah,
 )
+from src.agent.events import step
+from src.observability import observe, update_span
 from src.retrieval.hybrid_search import hybrid_search
 
 # --- TOOL SCHEMAS (format OpenAI) ---
@@ -139,11 +141,42 @@ TOOL_IMPLEMENTATION = {
 }
 
 
+def _summarize_result(result: dict) -> dict:
+    """Ringkasan hasil tool untuk tampilan langkah (CLI/streaming), bukan untuk LLM."""
+    if result.get("error"):
+        return {"found": False, "count": 0, "top": [], "error": result["error"]}
+    if isinstance(result.get("products"), list):
+        products = result["products"]
+        top = [{"id": p["id"], "name": p["name"], "price": p["formatted_price"], "stock": p["stock"]} for p in products[:3]]
+        return {"found": bool(products), "count": len(products), "top": top}
+    product = result.get("product")
+    if isinstance(product, dict):
+        top = [{"id": product["id"], "name": product["name"], "price": result.get("formatted_price"), "stock": product["stock"]}]
+        return {"found": True, "count": 1, "top": top}
+    if result.get("found") and result.get("product_name"):
+        top = [{"id": result["product_id"], "name": result["product_name"], "price": result["formatted_price"], "stock": result["stock"]}]
+        return {"found": True, "count": 1, "top": top}
+    return {"found": False, "count": 0, "top": []}
+
+
+@observe(name="tool-call", as_type="tool")
 def execute_tool(conn: sqlite3.Connection, tool_name: str, tool_input: dict) -> str:
-    fn = TOOL_IMPLEMENTATION.get(tool_name)
-    if fn is None:
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
-    try:
-        return json.dumps(fn(conn, **tool_input), default=str, ensure_ascii=False)
-    except TypeError:
-        return json.dumps({"error": f"Invalid arguments for {tool_name}"})
+    # Observation diberi nama tool yang dipanggil agar mudah dibaca di Langfuse.
+    update_span(name=f"tool:{tool_name}", input=tool_input)
+
+    with step("tool", name=tool_name, args=tool_input) as info:
+        fn = TOOL_IMPLEMENTATION.get(tool_name)
+        if fn is None:
+            result = {"error": f"Unknown tool: {tool_name}"}
+        else:
+            try:
+                result = fn(conn, **tool_input)
+            except TypeError:
+                result = {"error": f"Invalid arguments for {tool_name}"}
+        info.update(_summarize_result(result))
+
+    if "error" in result:
+        update_span(output=result, level="ERROR", status_message=result["error"])
+    else:
+        update_span(output=result)
+    return json.dumps(result, default=str, ensure_ascii=False)

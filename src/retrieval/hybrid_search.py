@@ -1,11 +1,16 @@
+import logging
 import re
 import sqlite3
 
 import numpy as np
 from rank_bm25 import BM25Okapi
 
+from src.agent.events import step
 from src.db.database import has_vector_index, lookup_product_by_id, vector_search
 from src.models.schemas import Product, ProductSearchResult
+from src.observability import observe, update_span
+
+logger = logging.getLogger("cs_agent.search")
 
 _bm25: BM25Okapi | None = None
 _bm25_ids: list[str] = []
@@ -29,7 +34,7 @@ def build_bm25_index(conn: sqlite3.Connection) -> None:
 
     rows = conn.execute("SELECT id, name, product_type, description FROM products").fetchall()
     if not rows:
-        print("[ bm25 ] tidak ada produk, index kosong", flush=True)
+        logger.warning("tidak ada produk, index BM25 kosong (jalankan seed)")
         _bm25, _bm25_ids = None, []
         return
 
@@ -40,7 +45,7 @@ def build_bm25_index(conn: sqlite3.Connection) -> None:
         ids.append(r["id"])
 
     _bm25, _bm25_ids = BM25Okapi(corpus), ids
-    print(f"[ bm25 ] {len(corpus)} produk ter-index", flush=True)
+    logger.info("BM25: %d produk ter-index", len(corpus))
 
 
 def _bm25_search(query: str, top_k: int = 20) -> list[tuple[str, float]]:
@@ -63,8 +68,24 @@ def _rrf_merge(*ranked_lists: list[tuple[str, float]], k: int = 60) -> list[tupl
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+@observe(name="hybrid-search", as_type="retriever")
 def hybrid_search(conn: sqlite3.Connection, query: str, top_k: int = 5) -> list[ProductSearchResult]:
     """BM25 + vector (RRF). Otomatis fallback ke BM25 saja bila vector search tidak tersedia."""
+    with step("search", query=query) as info:
+        results, method = _hybrid_search(conn, query, top_k)
+        info.update(
+            method=method,
+            count=len(results),
+            top=[
+                {"id": r.product.id, "name": r.product.name, "price": r.product.price_display(), "score": r.score}
+                for r in results[:3]
+            ],
+        )
+        return results
+
+
+def _hybrid_search(conn: sqlite3.Connection, query: str, top_k: int) -> tuple[list[ProductSearchResult], str]:
+    update_span(input={"query": query, "top_k": top_k})
     bm25_results = _bm25_search(query, top_k=20)
 
     vec_results: list[tuple[str, float]] = []
@@ -75,7 +96,7 @@ def hybrid_search(conn: sqlite3.Connection, query: str, top_k: int = 5) -> list[
             raw = vector_search(conn, embed(query), k=20)
             vec_results = [(pid, 1.0 / (1.0 + dist)) for pid, dist in raw]
         except Exception as e:
-            print(f"[ search ] vector search dilewati: {e}", flush=True)
+            logger.warning("vector search dilewati: %s", e)
             vec_results = []
 
     if vec_results:
@@ -104,4 +125,9 @@ def hybrid_search(conn: sqlite3.Connection, query: str, top_k: int = 5) -> list[
                 match_reason=method,
             )
         )
-    return results
+
+    update_span(
+        output=[{"id": r.product.id, "name": r.product.name, "score": r.score} for r in results],
+        metadata={"method": method, "bm25_hits": len(bm25_results), "vector_hits": len(vec_results)},
+    )
+    return results, method

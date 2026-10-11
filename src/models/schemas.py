@@ -64,7 +64,8 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
-    session_id: str = Field(default="default")
+    session_id: str = Field(default="default", description="Mengelompokkan giliran chat menjadi satu session di Langfuse")
+    user_id: str | None = Field(default=None, max_length=200, description="ID pelanggan (opsional), dicatat di Langfuse")
     history: list[ChatMessage] = Field(default_factory=list, max_length=20)
 
 
@@ -77,6 +78,7 @@ class ChatResponse(BaseModel):
         description="How the answer was grounded: 'db_lookup', 'hybrid_search', 'llm_only'",
     )
     session_id: str
+    trace_url: str | None = Field(default=None, description="Link trace di Langfuse (null bila tracing nonaktif)")
 
 
 # --- TOOL CALL ---
@@ -102,6 +104,7 @@ class ProductDetailResult(BaseModel):
 
 class AgentState(BaseModel):
     session_id: str
+    user_id: str | None = None
     user_message: str
     intent: Intent | None = None
     retrieved_products: list[ProductSearchResult] = Field(default_factory=list)
@@ -110,3 +113,4 @@ class AgentState(BaseModel):
     final_reply: str = ""
     sources: list[str] = Field(default_factory=list)
     shown_product_ids: list[str] = Field(default_factory=list)
+    trace_url: str | None = None

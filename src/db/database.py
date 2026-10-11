@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import struct
 from pathlib import Path
@@ -5,6 +6,8 @@ from pathlib import Path
 import numpy as np
 
 from src.config import DB_PATH
+
+logger = logging.getLogger("cs_agent.db")
 
 # Diset True kalau ekstensi sqlite-vec berhasil dimuat pada koneksi.
 VEC_AVAILABLE = False
@@ -37,7 +40,7 @@ def get_connection() -> sqlite3.Connection:
         VEC_AVAILABLE = True
     except Exception as e:  # ImportError, AttributeError (build tanpa extension), dll
         VEC_AVAILABLE = False
-        print(f"[ db ] sqlite-vec tidak tersedia ({e}); vector search dimatikan, pakai BM25 saja", flush=True)
+        logger.warning("sqlite-vec tidak tersedia (%s); vector search dimatikan, pakai BM25 saja", e)
 
     return conn
 
@@ -126,5 +129,5 @@ def vector_search(conn: sqlite3.Connection, query_embedding: np.ndarray, k: int 
         ).fetchall()
         return [(r["pid"], r["distance"]) for r in rows]
     except Exception as e:
-        print(f"[ db ] vector_search gagal: {e}", flush=True)
+        logger.warning("vector_search gagal: %s", e)
         return []
